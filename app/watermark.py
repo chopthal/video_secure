@@ -8,11 +8,11 @@ from pathlib import Path
 from typing import Callable, Optional, TypeVar
 
 from app.ffmpeg_utils import (
+    build_video_encoder_args,
     detect_gpu_encoder,
     find_ffmpeg,
     get_default_font,
     probe_video,
-    quality_to_crf,
 )
 from app.models import WatermarkPosition, WatermarkRequest
 
@@ -32,7 +32,7 @@ def _as_enum(enum_cls: type[E], value: E | str) -> E:
 
 
 def build_watermark_text(buyer_name: str, contact: str) -> str:
-    return f"이 강의는 {buyer_name} ({contact}) 님이 구매하신 영상입니다."
+    return f"{buyer_name} ({contact}) 님이 구매하신 영상입니다."
 
 
 def escape_drawtext(text: str) -> str:
@@ -77,10 +77,10 @@ def build_enable_expression(
     if mode == "static":
         return f"between(t,{start},{effective_end})"
 
-    # 주기적: 시작~종료 구간 안에서 interval마다 show초 동안 표시
+    # 주기적: interval초 주기의 처음 show초만 표시 (show < interval 필요)
     return (
         f"between(t,{start},{effective_end})*"
-        f"between(mod(t,{interval}),0,{show})"
+        f"lt(mod(t,{interval}),{show})"
     )
 
 
@@ -165,11 +165,14 @@ class WatermarkProcessor:
         ]
 
         use_gpu = request.use_gpu and self._gpu_encoder is not None
-        if use_gpu:
-            cmd.extend(["-c:v", self._gpu_encoder, "-preset", "p4"])
-        else:
-            crf = quality_to_crf(_enum_str(request.quality))
-            cmd.extend(["-c:v", "libx264", "-crf", str(crf), "-preset", "medium"])
+        cmd.extend(
+            build_video_encoder_args(
+                self._gpu_encoder,
+                _enum_str(request.quality),
+                use_gpu,
+                info.get("video_bitrate"),
+            )
+        )
 
         cmd.extend(["-movflags", "+faststart", str(output_path)])
 

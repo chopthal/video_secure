@@ -45,6 +45,12 @@ QUALITY_LABELS: dict[QualityPreset, str] = {
 }
 
 
+def _sanitize_filename(name: str) -> str:
+    for ch in '<>:"/\\|?*':
+        name = name.replace(ch, "_")
+    return name.strip() or "unknown"
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -139,8 +145,14 @@ class MainWindow(QMainWindow):
         periodic_layout.setContentsMargins(0, 0, 0, 0)
         self._interval_seconds = QLineEdit("30")
         self._show_seconds = QLineEdit("5")
-        periodic_layout.addRow("표시 간격 (초)", self._interval_seconds)
+        periodic_layout.addRow("주기 (초)", self._interval_seconds)
+        self._interval_hint = QLabel("한 주기 길이 (예: 30 → 30초마다 반복)")
+        self._interval_hint.setStyleSheet("color: #888; font-size: 11px;")
+        periodic_layout.addRow("", self._interval_hint)
         periodic_layout.addRow("표시 시간 (초)", self._show_seconds)
+        self._show_hint = QLabel("주기 안에서 표시할 시간 (주기보다 짧게)")
+        self._show_hint.setStyleSheet("color: #888; font-size: 11px;")
+        periodic_layout.addRow("", self._show_hint)
         wm_form.addRow(self._periodic_widget)
 
         self._position_combo = QComboBox()
@@ -271,8 +283,14 @@ class MainWindow(QMainWindow):
     def _update_opacity_label(self, value: int) -> None:
         self._opacity_label.setText(f"{value}%")
 
+    def _get_mode(self) -> WatermarkMode:
+        data = self._mode_combo.currentData()
+        if isinstance(data, WatermarkMode):
+            return data
+        return WatermarkMode(str(data))
+
     def _toggle_mode_ui(self) -> None:
-        is_periodic = self._mode_combo.currentData() == WatermarkMode.PERIODIC
+        is_periodic = self._get_mode() == WatermarkMode.PERIODIC
         self._periodic_widget.setVisible(is_periodic)
 
     def _toggle_end_time_ui(self) -> None:
@@ -347,20 +365,30 @@ class MainWindow(QMainWindow):
 
         interval = 30.0
         show = 5.0
-        if self._mode_combo.currentData() == WatermarkMode.PERIODIC:
+        mode = self._get_mode()
+        if mode == WatermarkMode.PERIODIC:
             try:
                 interval = float(self._interval_seconds.text().strip())
                 show = float(self._show_seconds.text().strip())
                 if interval <= 0 or show <= 0:
                     raise ValueError
             except ValueError:
-                QMessageBox.warning(self, "입력 오류", "표시 간격과 표시 시간은 0보다 커야 합니다.")
+                QMessageBox.warning(self, "입력 오류", "주기와 표시 시간은 0보다 커야 합니다.")
+                return None
+            if show >= interval:
+                QMessageBox.warning(
+                    self,
+                    "입력 오류",
+                    "표시 시간이 주기와 같거나 길면 워터마크가 계속 표시됩니다.\n"
+                    "표시 시간을 주기보다 짧게 설정해 주세요.\n"
+                    "(예: 주기 10초, 표시 3초)",
+                )
                 return None
 
         return WatermarkRequest(
             buyer_name=buyer,
             contact=contact,
-            mode=self._mode_combo.currentData(),
+            mode=mode,
             start_seconds=start,
             end_seconds=end,
             interval_seconds=interval,
@@ -377,9 +405,9 @@ class MainWindow(QMainWindow):
             return None
 
         out_dir = self._output_dir or self._input_path.parent
+        buyer = _sanitize_filename(request.buyer_name)
         stem = self._input_path.stem
-        safe_name = f"watermarked_{stem}.mp4"
-        return out_dir / safe_name
+        return out_dir / f"{buyer}_{stem}.mp4"
 
     def _start_processing(self) -> None:
         if self._processor is None:

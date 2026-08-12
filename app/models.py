@@ -21,9 +21,9 @@ class WatermarkPosition(str, Enum):
 
 
 class QualityPreset(str, Enum):
-    HIGH = "high"
-    STANDARD = "standard"
-    SMALL = "small"
+    HIGH = "high"  # 고품질 — 원본 코덱(HEVC면 HEVC)
+    MEDIUM = "medium"  # 중간 — H.264
+    LOW = "low"  # 저품질 — H.264
 
 
 @dataclass
@@ -35,8 +35,8 @@ class WatermarkRequest:
     end_seconds: Optional[float] = None
     interval_seconds: float = 30.0
     show_seconds: float = 5.0
-    position: WatermarkPosition = WatermarkPosition.BOTTOM_CENTER
+    position: WatermarkPosition = WatermarkPosition.TOP_LEFT
     font_size: int = 24
     opacity: float = 0.7
-    quality: QualityPreset = QualityPreset.STANDARD
+    quality: QualityPreset = QualityPreset.HIGH
     use_gpu: bool = False

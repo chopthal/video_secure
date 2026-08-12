@@ -39,9 +39,9 @@ POSITION_LABELS: dict[WatermarkPosition, str] = {
 }
 
 QUALITY_LABELS: dict[QualityPreset, str] = {
-    QualityPreset.HIGH: "고화질 (용량 큼)",
-    QualityPreset.STANDARD: "표준",
-    QualityPreset.SMALL: "작은 파일 (용량 작음)",
+    QualityPreset.HIGH: "고품질 (원본 코덱 사용)",
+    QualityPreset.MEDIUM: "중간 (H.264)",
+    QualityPreset.LOW: "저품질",
 }
 
 
@@ -158,7 +158,7 @@ class MainWindow(QMainWindow):
         self._position_combo = QComboBox()
         for pos, label in POSITION_LABELS.items():
             self._position_combo.addItem(label, pos)
-        self._position_combo.setCurrentIndex(5)  # bottom_center
+        self._position_combo.setCurrentIndex(0)  # top_left
         wm_form.addRow("위치", self._position_combo)
 
         self._font_size = QLineEdit("24")
@@ -184,7 +184,7 @@ class MainWindow(QMainWindow):
         self._quality_combo = QComboBox()
         for preset, label in QUALITY_LABELS.items():
             self._quality_combo.addItem(label, preset)
-        self._quality_combo.setCurrentIndex(1)
+        self._quality_combo.setCurrentIndex(0)
         output_form.addRow("출력 품질", self._quality_combo)
 
         out_row = QWidget()
@@ -320,6 +320,12 @@ class MainWindow(QMainWindow):
             self._video_info_label.setText(
                 f"{info['filename']} · {format_seconds(info['duration'])} · "
                 f"{info['width']}x{info['height']}"
+                + (
+                    f" · {info['video_bitrate'] // 1000}kbps"
+                    if info.get("video_bitrate")
+                    else ""
+                )
+                + (f" · {info['codec_name']}" if info.get("codec_name") else "")
             )
         except Exception as exc:
             self._video_info_label.setText(f"정보 읽기 실패: {exc}")
@@ -396,7 +402,11 @@ class MainWindow(QMainWindow):
             position=self._position_combo.currentData(),
             font_size=font_size,
             opacity=self._opacity_slider.value() / 100.0,
-            quality=self._quality_combo.currentData(),
+            quality=(
+                self._quality_combo.currentData()
+                if isinstance(self._quality_combo.currentData(), QualityPreset)
+                else QualityPreset(str(self._quality_combo.currentData()))
+            ),
             use_gpu=self._use_gpu.isChecked(),
         )
 

@@ -9,7 +9,7 @@ from typing import Callable, Optional, TypeVar
 
 from app.ffmpeg_utils import (
     build_video_encoder_args,
-    detect_gpu_encoder,
+    detect_gpu_encoders,
     find_ffmpeg,
     get_default_font,
     probe_video,
@@ -128,15 +128,16 @@ class WatermarkProcessor:
     def __init__(self) -> None:
         self._ffmpeg = find_ffmpeg()
         self._font_path = get_default_font()
-        self._gpu_encoder = detect_gpu_encoder(self._ffmpeg)
+        self._gpu_encoders = detect_gpu_encoders(self._ffmpeg)
 
     @property
     def gpu_available(self) -> bool:
-        return self._gpu_encoder is not None
+        return bool(self._gpu_encoders.get("h264") or self._gpu_encoders.get("hevc"))
 
     @property
     def gpu_encoder_name(self) -> Optional[str]:
-        return self._gpu_encoder
+        names = [n for n in (self._gpu_encoders.get("h264"), self._gpu_encoders.get("hevc")) if n]
+        return ", ".join(names) if names else None
 
     def probe(self, input_path: Path) -> dict:
         return probe_video(input_path)
@@ -164,13 +165,16 @@ class WatermarkProcessor:
             "copy",
         ]
 
-        use_gpu = request.use_gpu and self._gpu_encoder is not None
+        use_gpu = request.use_gpu and self.gpu_available
         cmd.extend(
             build_video_encoder_args(
-                self._gpu_encoder,
+                self._gpu_encoders,
                 _enum_str(request.quality),
                 use_gpu,
                 info.get("video_bitrate"),
+                info.get("width", 0),
+                info.get("height", 0),
+                info.get("codec_name", ""),
             )
         )
 

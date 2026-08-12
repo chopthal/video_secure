@@ -104,106 +104,216 @@ def probe_video(path: Path) -> dict:
     width, height = 0, 0
     video_bitrate: int | None = None
     audio_bitrate = 0
+    codec_name = ""
     for stream in data.get("streams", []):
         if stream.get("codec_type") == "audio" and stream.get("bit_rate"):
             audio_bitrate += int(stream.get("bit_rate", 0))
         if stream.get("codec_type") == "video":
             width = int(stream.get("width", 0))
             height = int(stream.get("height", 0))
+            codec_name = stream.get("codec_name", "") or ""
             if stream.get("bit_rate"):
                 video_bitrate = int(stream.get("bit_rate"))
+
     if video_bitrate is None:
         format_bitrate = data.get("format", {}).get("bit_rate")
-        if format_bitrate and duration > 0:
-            total = int(format_bitrate)
-            video_bitrate = max(total - audio_bitrate, 0) or None
+        if format_bitrate:
+            video_bitrate = max(int(format_bitrate) - audio_bitrate, 0) or None
+
+    # MOV/HEVC 등에서 bit_rate가 비어 있으면 파일 크기로 추정
+    if (video_bitrate is None or video_bitrate < 100_000) and duration > 0:
+        try:
+            size_bits = path.stat().st_size * 8
+            estimated = int(size_bits / duration) - audio_bitrate
+            if estimated > 100_000:
+                video_bitrate = estimated
+        except OSError:
+            pass
+
     return {
         "duration": duration,
         "width": width,
         "height": height,
         "filename": path.name,
         "video_bitrate": video_bitrate,
+        "codec_name": codec_name,
     }
 
 
-def detect_gpu_encoder(ffmpeg: str) -> str | None:
+def is_hevc_codec(codec_name: str) -> bool:
+    return codec_name.lower() in {"hevc", "h265", "hev1", "hvc1"}
+
+
+def detect_gpu_encoders(ffmpeg: str) -> dict[str, str | None]:
+    """가용 GPU 인코더. keys: h264, hevc."""
     result = subprocess.run(
         [ffmpeg, "-hide_banner", "-encoders"],
         capture_output=True,
         **_SUBPROCESS_TEXT,
     )
     encoders = result.stdout + result.stderr
+    h264 = None
+    hevc = None
     if "h264_nvenc" in encoders:
-        return "h264_nvenc"
-    if "h264_qsv" in encoders:
-        return "h264_qsv"
-    if "h264_amf" in encoders:
-        return "h264_amf"
-    return None
+        h264 = "h264_nvenc"
+    elif "h264_qsv" in encoders:
+        h264 = "h264_qsv"
+    elif "h264_amf" in encoders:
+        h264 = "h264_amf"
+
+    if "hevc_nvenc" in encoders:
+        hevc = "hevc_nvenc"
+    elif "hevc_qsv" in encoders:
+        hevc = "hevc_qsv"
+    elif "hevc_amf" in encoders:
+        hevc = "hevc_amf"
+
+    return {"h264": h264, "hevc": hevc}
 
 
-def quality_to_crf(preset: str) -> int:
-    mapping = {"high": 15, "standard": 20, "small": 24}
-    return mapping.get(preset, 20)
+def detect_gpu_encoder(ffmpeg: str) -> str | None:
+    """하위 호환: H.264 GPU 인코더 우선."""
+    found = detect_gpu_encoders(ffmpeg)
+    return found["h264"] or found["hevc"]
 
 
-def quality_to_x264_preset(preset: str) -> str:
-    mapping = {"high": "slow", "standard": "medium", "small": "medium"}
-    return mapping.get(preset, "medium")
+def _bitrate_floor_kbps(width: int, height: int) -> int:
+    pixels = max(width * height, 1)
+    if pixels >= 1920 * 1080:
+        return 8_000
+    if pixels >= 1280 * 720:
+        return 5_000
+    return 2_500
+
+
+def resolve_target_bitrate_kbps(
+    quality: str,
+    source_video_bitrate: int | None,
+    width: int = 0,
+    height: int = 0,
+    keep_hevc: bool = False,
+) -> int:
+    floor = _bitrate_floor_kbps(width, height)
+    source_kbps = int(source_video_bitrate / 1000) if source_video_bitrate else 0
+
+    if quality == "high":
+        # 원본 코덱 유지: 비트레이트도 원본에 맞춤 (HEVC→HEVC는 부스트 불필요)
+        if source_kbps > 0:
+            return max(source_kbps if keep_hevc else int(source_kbps * 1.15), floor)
+        return max(floor, 12_000 if keep_hevc else 14_000)
+
+    if quality == "medium":
+        if source_kbps > 0:
+            return max(int(source_kbps * 0.7), floor)
+        return max(floor, 8_000)
+
+    # low
+    if source_kbps > 0:
+        return max(int(source_kbps * 0.4), 2_000)
+    return 4_000
+
+
+def _append_bitrate_args(args: list[str], target_kbps: int) -> None:
+    maxrate = int(target_kbps * 1.5)
+    bufsize = int(target_kbps * 2)
+    args.extend(
+        [
+            "-b:v",
+            f"{target_kbps}k",
+            "-maxrate",
+            f"{maxrate}k",
+            "-bufsize",
+            f"{bufsize}k",
+        ]
+    )
+
+
+def _build_h264_gpu_args(
+    encoder: str, quality: str, target_kbps: int, cq: int
+) -> list[str]:
+    args = ["-c:v", encoder]
+    if quality == "low":
+        if encoder == "h264_nvenc":
+            args.extend(["-rc", "vbr", "-cq", str(cq), "-b:v", "0", "-preset", "p4"])
+        elif encoder == "h264_qsv":
+            args.extend(["-global_quality", str(cq)])
+        else:
+            args.extend(["-rc", "vbr_latency", "-qp_i", str(cq), "-qp_p", str(cq)])
+    else:
+        _append_bitrate_args(args, target_kbps)
+        if encoder == "h264_nvenc":
+            args.extend(["-rc", "vbr", "-cq", str(cq), "-preset", "p5" if quality == "high" else "p4"])
+        elif encoder == "h264_amf":
+            args.extend(["-rc", "vbr_peak"])
+    args.extend(["-pix_fmt", "yuv420p", "-profile:v", "high", "-level", "4.2"])
+    return args
+
+
+def _build_hevc_gpu_args(encoder: str, target_kbps: int, cq: int) -> list[str]:
+    args = ["-c:v", encoder]
+    _append_bitrate_args(args, target_kbps)
+    if encoder == "hevc_nvenc":
+        args.extend(["-rc", "vbr", "-cq", str(cq), "-preset", "p5"])
+    elif encoder == "hevc_amf":
+        args.extend(["-rc", "vbr_peak"])
+    # Apple/모바일 MP4 HEVC 호환 태그
+    args.extend(["-pix_fmt", "yuv420p", "-tag:v", "hvc1"])
+    return args
 
 
 def build_video_encoder_args(
-    gpu_encoder: str | None,
+    gpu_encoders: dict[str, str | None] | str | None,
     quality: str,
     use_gpu: bool,
     source_video_bitrate: int | None = None,
+    width: int = 0,
+    height: int = 0,
+    codec_name: str = "",
 ) -> list[str]:
-    """모바일 호환(yuv420p) 및 품질 프리셋에 맞는 인코더 옵션."""
-    q = quality_to_crf(quality)
-    mobile_compat = ["-pix_fmt", "yuv420p", "-profile:v", "high", "-level", "4.1"]
+    """
+    품질 프리셋별 인코더 옵션.
 
-    if use_gpu and gpu_encoder:
-        args = ["-c:v", gpu_encoder]
-        if gpu_encoder == "h264_nvenc":
-            nvenc_preset = "p5" if quality == "high" else "p4"
-            args.extend(
-                [
-                    "-rc",
-                    "vbr",
-                    "-cq",
-                    str(q),
-                    "-b:v",
-                    "0",
-                    "-preset",
-                    nvenc_preset,
-                ]
-            )
-        elif gpu_encoder == "h264_qsv":
-            args.extend(["-global_quality", str(q)])
-        elif gpu_encoder == "h264_amf":
-            args.extend(
-                [
-                    "-rc",
-                    "vbr_latency",
-                    "-qp_i",
-                    str(q),
-                    "-qp_p",
-                    str(q),
-                ]
-            )
-        args.extend(mobile_compat)
+    - high: 원본이 HEVC면 HEVC, 아니면 H.264 (비트레이트 ≈ 원본)
+    - medium / low: 항상 H.264
+    """
+    if isinstance(gpu_encoders, str) or gpu_encoders is None:
+        # 하위 호환: 단일 문자열이면 H.264로 취급
+        gpu_encoders = {"h264": gpu_encoders, "hevc": None}
+
+    keep_hevc = quality == "high" and is_hevc_codec(codec_name)
+    target_kbps = resolve_target_bitrate_kbps(
+        quality, source_video_bitrate, width, height, keep_hevc=keep_hevc
+    )
+    cq_map = {"high": 18, "medium": 23, "low": 28}
+    cq = cq_map.get(quality, 23)
+
+    if keep_hevc:
+        hevc_gpu = gpu_encoders.get("hevc") if use_gpu else None
+        if hevc_gpu:
+            return _build_hevc_gpu_args(hevc_gpu, target_kbps, cq)
+        # CPU libx265 — 원본 비트레이트에 맞춤
+        args = [
+            "-c:v",
+            "libx265",
+            "-preset",
+            "medium",
+            "-x265-params",
+            "log-level=error",
+        ]
+        _append_bitrate_args(args, target_kbps)
+        args.extend(["-pix_fmt", "yuv420p", "-tag:v", "hvc1"])
         return args
 
-    args = [
-        "-c:v",
-        "libx264",
-        "-crf",
-        str(q),
-        "-preset",
-        quality_to_x264_preset(quality),
-    ]
-    if quality == "high" and source_video_bitrate and source_video_bitrate > 500_000:
-        kbps = max(int(source_video_bitrate / 1000), 2000)
-        args.extend(["-maxrate", f"{kbps}k", "-bufsize", f"{kbps * 2}k"])
-    args.extend(mobile_compat)
+    # H.264 경로 (중간/저품질, 또는 원본이 H.264인 고품질)
+    h264_gpu = gpu_encoders.get("h264") if use_gpu else None
+    if h264_gpu:
+        return _build_h264_gpu_args(h264_gpu, quality, target_kbps, cq)
+
+    preset = "slow" if quality == "high" else "medium"
+    args = ["-c:v", "libx264", "-preset", preset]
+    if quality == "low":
+        args.extend(["-crf", str(cq)])
+    else:
+        _append_bitrate_args(args, target_kbps)
+    args.extend(["-pix_fmt", "yuv420p", "-profile:v", "high", "-level", "4.2"])
     return args
